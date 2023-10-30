@@ -1,0 +1,17 @@
+[package]
+name = "borrow-visualiser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.75"
+eframe = "0.22.0"
+egui = "0.22.0"
+egui_extras = {version = "0.22.0", features=["image"]}
+egui_file = "0.10.0"
+gsgdt = "0.1.2"
+image = { version = "0.24", default-features = false, features = ["png"] }
+log = "0.4.20"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
