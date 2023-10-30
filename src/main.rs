@@ -28,11 +28,9 @@ extern crate egui_extras;
 use anyhow::Context;
 use eframe::egui;
 use egui_extras::RetainedImage;
-use rustc_driver::Compilation;
 use rustc_errors::registry;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_interface::interface::Compiler;
 use rustc_interface::Queries;
 use std::io::{Read, Write};
 
@@ -163,17 +161,6 @@ impl<'a> MyCallbacks<'a> {
     }
 }
 
-impl rustc_driver::Callbacks for MyCallbacks<'_> {
-    fn after_analysis<'tcx>(
-        &mut self,
-        _compiler: &Compiler,
-        queries: &'tcx Queries<'tcx>,
-    ) -> Compilation {
-        self.analyse(queries);
-        Compilation::Stop
-    }
-}
-
 fn get_sysroot() -> Option<std::path::PathBuf> {
     let out = process::Command::new("rustc")
         .arg("--print=sysroot")
@@ -186,8 +173,8 @@ fn get_sysroot() -> Option<std::path::PathBuf> {
         .ok()
 }
 
-fn rs_to_mir_png(rs_file: &Path, functions: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let config = rustc_interface::Config {
+fn config_from_file(rs_file: &Path) -> rustc_interface::Config {
+    rustc_interface::Config {
         opts: config::Options {
             edition: rustc_span::edition::Edition::Edition2024,
             maybe_sysroot: get_sysroot(),
@@ -210,10 +197,37 @@ fn rs_to_mir_png(rs_file: &Path, functions: &[String]) -> anyhow::Result<Vec<(St
         expanded_args: Vec::default(),
         ice_file: None,
         hash_untracked_state: None,
-    };
+    }
+}
 
+fn get_rs_functions(rs_file: &Path) -> anyhow::Result<Vec<String>> {
+    rustc_driver::catch_fatal_errors(|| {
+        rustc_interface::run_compiler(config_from_file(rs_file), |compiler| {
+            let mut fn_names: Vec<String> = Vec::default();
+            compiler.enter(|queries| {
+                queries.global_ctxt().unwrap().enter(|tcx| {
+                    for def_id in tcx.hir_crate_items(()).definitions() {
+                        let def_kind = tcx.def_kind(def_id);
+
+                        if def_kind != DefKind::Fn && def_kind != DefKind::AssocFn {
+                            continue;
+                        }
+                        let fn_name = tcx.item_name(def_id.into());
+
+                        fn_names.push(fn_name.to_string());
+                    }
+                });
+            });
+            fn_names
+        })
+    })
+    .ok()
+    .context("Rustc compiler error")
+}
+
+fn rs_to_mir_png(rs_file: &Path, functions: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let my_cb = rustc_driver::catch_fatal_errors(|| {
-        rustc_interface::run_compiler(config, |compiler| {
+        rustc_interface::run_compiler(config_from_file(rs_file), |compiler| {
             let mut my_cb = MyCallbacks::new(functions);
             compiler.enter(|queries| {
                 my_cb.analyse(queries);
@@ -286,7 +300,8 @@ struct MirExplorer {
     pub mir_graphs: Vec<MirWidget>,
     opened_file: Option<PathBuf>,
     open_file_dialog: Option<FileDialog>,
-    functions: String,
+    functions: Vec<String>,
+    fn_selected: Vec<bool>,
 }
 
 impl MirExplorer {
@@ -294,15 +309,17 @@ impl MirExplorer {
         if ui.add(egui::Button::new("Render!")).clicked()
             || ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
-            let fns: Vec<_> = self
-                .functions
-                .split(' ')
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
             if let Some(open_file) = &self.opened_file {
                 self.mir_graphs = {
-                    match rs_to_mir_png(open_file, &fns) {
+                    let filtered_fns: Vec<String> = self
+                        .functions
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| self.fn_selected[*i])
+                        .map(|(_, fnn)| fnn.clone())
+                        .collect();
+
+                    match rs_to_mir_png(open_file, &filtered_fns) {
                         Ok(graphs) => graphs
                             .into_iter()
                             .map(|(name, raw_png)| MirWidget::new(name, raw_png))
@@ -325,11 +342,10 @@ impl MirExplorer {
 impl eframe::App for MirExplorer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::SidePanel::left("my_left_panel").show(ctx, |ui| {
-            ui.heading("Filters");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.functions)
-                    .hint_text("Functions (space-separated)"),
-            );
+            ui.heading("Functions");
+            for (i, fn_name) in self.functions.iter().enumerate() {
+                ui.checkbox(&mut self.fn_selected[i], fn_name);
+            }
         });
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             egui::Grid::new("main-controls")
@@ -350,6 +366,11 @@ impl eframe::App for MirExplorer {
                     if let Some(dialog) = &mut self.open_file_dialog {
                         if dialog.show(ctx).selected() {
                             if let Some(file) = dialog.path() {
+                                self.functions = get_rs_functions(file).unwrap(); // FIXME
+                                self.fn_selected = Vec::with_capacity(self.functions.len());
+                                for _ in self.functions.iter() {
+                                    self.fn_selected.push(false)
+                                }
                                 self.opened_file = Some(file.to_path_buf());
                             }
                         }
