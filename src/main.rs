@@ -11,155 +11,28 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self};
 use std::sync::Arc;
 
-use egui::{Ui, Vec2};
+use egui::epaint::{CubicBezierShape, PathShape};
+use egui::{
+    vec2, Color32, Label, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke, TextStyle, Ui,
+    Vec2, Widget,
+};
 use egui_file::FileDialog;
-use gsgdt::GraphvizSettings;
-use gsgdt::{Edge, Graph, Node, NodeStyle};
+
 use rustc_middle::mir::*;
-use rustc_middle::ty::TyCtxt;
+
 use rustc_session::config::{self, Cfg, CheckCfg};
 
 extern crate eframe;
 extern crate egui_extras;
 use anyhow::Context;
 use eframe::egui;
-use egui_extras::RetainedImage;
 use rustc_errors::registry;
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::DefId;
-use rustc_interface::Queries;
-use std::io::{Read, Write};
-
-struct FnVis {
-    pub unique_name: String,
-    pub dot: Vec<u8>,
-}
-
-struct MyCallbacks<'a> {
-    filters: &'a [String],
-    graphs: Vec<FnVis>,
-}
-
-/// Convert an MIR function into a gsgdt Graph
-pub fn mir_fn_to_generic_graph(body: &Body<'_>) -> Graph {
-    let def_id = body.source.def_id();
-    let def_name = graphviz_safe_def_name(def_id);
-    let graph_name = format!("Mir_{}", def_name);
-
-    let nodes: Vec<Node> = body
-        .basic_blocks
-        .iter_enumerated()
-        .map(|(block, _)| bb_to_graph_node(block, body))
-        .collect();
-
-    let edges = body
-        .basic_blocks
-        .iter_enumerated()
-        .flat_map(|(source, _)| {
-            let terminator = body[source].terminator();
-            let labels = terminator.kind.fmt_successor_labels();
-            terminator
-                .successors()
-                .zip(labels)
-                .map(move |(target, label)| {
-                    let src = node(def_id, source);
-                    let trg = node(def_id, target);
-                    Edge::new(src, trg, label.to_string())
-                })
-        })
-        .collect();
-
-    Graph::new(graph_name, nodes, edges)
-}
-
-fn bb_to_graph_node(block: BasicBlock, body: &Body<'_>) -> Node {
-    let def_id = body.source.def_id();
-    let data = &body[block];
-    let label = node(def_id, block);
-
-    let (title, bgcolor) = if data.is_cleanup {
-        (format!("{} (cleanup)", block.index()), "lightblue")
-    } else {
-        (format!("{}", block.index()), "gray")
-    };
-
-    let style = NodeStyle {
-        title_bg: Some(bgcolor.to_owned()),
-        ..Default::default()
-    };
-
-    let mut stmts: Vec<String> = data
-        .statements
-        .iter() // Filter out the boring ones!
-        .filter(|s| s.kind.name() != "StorageLive" && s.kind.name() != "StorageDead")
-        .map(|x| format!("{:?}", x))
-        .collect();
-
-    // add the terminator to the stmts, gsgdt can print it out separately
-    let mut terminator_head = String::new();
-    data.terminator()
-        .kind
-        .fmt_head(&mut terminator_head)
-        .unwrap();
-    stmts.push(terminator_head);
-
-    Node::new(stmts, label, title, style)
-}
-
-// Must match `[0-9A-Za-z_]*`. This does not appear in the rendered graph, so
-// it does not have to be user friendly.
-pub fn graphviz_safe_def_name(def_id: DefId) -> String {
-    format!("{}_{}", def_id.krate.index(), def_id.index.index(),)
-}
-
-fn node(def_id: DefId, block: BasicBlock) -> String {
-    format!("bb{}__{}", block.index(), graphviz_safe_def_name(def_id))
-}
-
-impl<'a> MyCallbacks<'a> {
-    pub fn new(filters: &'a [String]) -> Self {
-        MyCallbacks {
-            filters,
-            graphs: Vec::default(),
-        }
-    }
-
-    fn analyse_with_context(&mut self, tcx: TyCtxt) {
-        for def_id in tcx.hir_crate_items(()).definitions() {
-            let def_kind = tcx.def_kind(def_id);
-            // We only care about function bodies
-            if def_kind != DefKind::Fn && def_kind != DefKind::AssocFn {
-                continue;
-            }
-            let fn_name = tcx.item_name(def_id.into());
-
-            if !self.filters.is_empty() && !self.filters.iter().any(|f| f == fn_name.as_str()) {
-                continue;
-            }
-            let graph = mir_fn_to_generic_graph(tcx.optimized_mir(def_id));
-            let settings = GraphvizSettings::default();
-
-            let mut dot = Vec::default();
-            graph
-                .to_dot(&mut dot, &settings, false)
-                .expect("Could not render graph!");
-
-            let unique_name = format!("{}-{}", fn_name, graph.name);
-            self.graphs.push(FnVis { unique_name, dot });
-        }
-    }
-
-    fn analyse<'tcx>(&mut self, queries: &'tcx Queries<'tcx>) {
-        queries
-            .global_ctxt()
-            .unwrap()
-            .enter(|tcx| self.analyse_with_context(tcx));
-    }
-}
 
 fn get_sysroot() -> Option<std::path::PathBuf> {
     let out = process::Command::new("rustc")
@@ -225,79 +98,245 @@ fn get_rs_functions(rs_file: &Path) -> anyhow::Result<Vec<String>> {
     .context("Rustc compiler error")
 }
 
-fn rs_to_mir_png(rs_file: &Path, functions: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let my_cb = rustc_driver::catch_fatal_errors(|| {
+fn rs_to_mir(rs_file: &Path, functions: &[String]) -> anyhow::Result<Vec<MirBody>> {
+    rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config_from_file(rs_file), |compiler| {
-            let mut my_cb = MyCallbacks::new(functions);
+            let mut mir_bodies: Vec<MirBody> = Vec::default();
             compiler.enter(|queries| {
-                my_cb.analyse(queries);
+                queries.global_ctxt().unwrap().enter(|tcx| {
+                    for def_id in tcx.hir_crate_items(()).definitions() {
+                        let def_kind = tcx.def_kind(def_id);
+
+                        if def_kind != DefKind::Fn && def_kind != DefKind::AssocFn {
+                            continue;
+                        }
+                        let fn_name = tcx.item_name(def_id.into());
+
+                        if !functions.contains(&fn_name.as_str().to_owned()) {
+                            // FIXME: move this logic!
+                            continue;
+                        }
+
+                        mir_bodies.push(MirBody::new(
+                            fn_name.as_str().to_string(),
+                            tcx.optimized_mir(def_id),
+                        ));
+                    }
+                });
             });
-            my_cb
+            mir_bodies
         })
     })
     .ok()
-    .context("Rustc compiler error")?;
+    .context("Rustc compiler error")
+}
 
-    let mut images = Vec::default();
+struct MirEdge {
+    from: BasicBlock,
+    to: BasicBlock,
+}
 
-    for f in my_cb.graphs {
-        let mut dot_cmd = Command::new("dot")
-            .arg("-Tpng")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("Cannot run dot!")?;
+impl MirEdge {
+    fn draw(&self, rects: &HashMap<BasicBlock, Rect>, ui: &Ui) {
+        let from = *rects.get(&self.from).unwrap();
+        let to = rects.get(&self.to).unwrap();
 
-        let mut stdout = dot_cmd
-            .stdout
-            .take()
-            .context("Cannot get stdout for dot!")?;
+        let src_pos = from.center_bottom();
+        let dst_pos = to.center_top() - vec2(10.0, 10.0);
+        let stroke = egui::Stroke {
+            width: 2.0,
+            color: Color32::from_rgb(96, 70, 59),
+        };
 
-        let mut stdin = dot_cmd.stdin.take().context("Cannot get stdin for dot!")?;
-        stdin.write_all(&f.dot).context("Unable to write stdin!")?;
-        drop(stdin);
+        let control_scale = ((dst_pos.x - src_pos.x) / 2.0).max(30.0);
+        let src_control = src_pos + Vec2::X * control_scale;
+        let dst_control = dst_pos - Vec2::X * control_scale;
 
-        let mut rendered = Vec::new();
+        let bezier = CubicBezierShape::from_points_stroke(
+            [src_pos, src_control, dst_control, dst_pos],
+            false,
+            Color32::TRANSPARENT,
+            stroke,
+        );
 
-        stdout
-            .read_to_end(&mut rendered)
-            .context("Unable to read  dot file from stdout!")?;
+        ui.painter().add(bezier);
+        ui.painter().circle_stroke(src_pos, 2.0, stroke);
 
-        images.push((f.unique_name, rendered));
+        ui.painter().add(end_triangle(
+            dst_pos,
+            to.center_top() - vec2(2.0, 2.0),
+            0.5,
+            stroke.color,
+            stroke,
+        ));
     }
-
-    Ok(images)
 }
 
-struct MirWidget {
+struct MirNode {
+    id: BasicBlock,
+    name: String,
+    statements: Vec<String>,
+}
+
+impl Widget for &MirNode {
+    fn ui(self, ui: &mut Ui) -> egui::Response {
+        let margin = egui::vec2(15.0, 5.0);
+        let gunmetal = Color32::from_rgb(46, 49, 56);
+
+        let background_shape = ui.painter().add(Shape::Noop);
+        let outer_rect_bounds = ui.available_rect_before_wrap();
+        let mut inner_rect = outer_rect_bounds.shrink2(margin);
+        inner_rect.max.x = inner_rect.max.x.max(inner_rect.min.x);
+        inner_rect.max.y = inner_rect.max.y.max(inner_rect.min.y);
+
+        let mut child_ui = ui.child_ui(inner_rect, *ui.layout());
+
+        let mut node_rect = outer_rect_bounds;
+
+        child_ui.vertical(|ui| {
+            ui.add(Label::new(
+                RichText::new(&self.name).text_style(TextStyle::Button),
+            ));
+            ui.add_space(margin.y);
+            ui.add(Label::new(RichText::new(self.statements.join("\n")).code()));
+            node_rect = ui.min_rect();
+        });
+
+        let box_rect = node_rect.expand2(margin);
+
+        let box_shape = Shape::Rect(egui::epaint::RectShape {
+            rect: box_rect,
+            rounding: Rounding::same(5.0),
+            fill: Color32::from_rgb(204, 201, 231),
+            stroke: Stroke {
+                width: 1.0,
+                color: gunmetal,
+            },
+        });
+
+        ui.painter().set(background_shape, box_shape);
+        ui.allocate_rect(box_rect, Sense::click())
+    }
+}
+
+struct NodeRow {
+    nodes: Vec<MirNode>,
+}
+
+impl NodeRow {
+    fn draw(&self, ui: &mut Ui) -> Vec<(BasicBlock, Rect)> {
+        let mut rects = Vec::new();
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+            for node in self.nodes.iter() {
+                let response = ui.add(node);
+                rects.push((node.id, response.rect));
+                ui.add_space(5.0) // FIXME standardise
+            }
+        });
+        rects
+    }
+}
+
+struct MirBody {
     label: String,
-    render: RetainedImage,
+    rows: Vec<NodeRow>,
+    edges: Vec<MirEdge>,
 }
 
-impl MirWidget {
-    fn new(label: String, img: Vec<u8>) -> Self {
-        MirWidget {
-            label,
-            render: RetainedImage::from_image_bytes("MIR.png", &img).unwrap(),
+impl MirBody {
+    fn new(fn_name: String, body: &Body<'_>) -> MirBody {
+        let mut rows: Vec<NodeRow> = Vec::new();
+        let mut edges: Vec<MirEdge> = Vec::new();
+
+        let root = body.basic_blocks.iter_enumerated().next().unwrap();
+        let mut backlog = vec![root];
+        let mut seen: HashSet<_> = HashSet::new();
+
+        while !backlog.is_empty() {
+            let this_row = backlog;
+            backlog = Vec::new();
+
+            for (idx, node) in this_row.iter() {
+                let terminator = node.terminator();
+
+                for successor in terminator.successors() {
+                    edges.push(MirEdge {
+                        from: *idx,
+                        to: successor,
+                    });
+
+                    if seen.insert(successor) {
+                        backlog.push((successor, &body[successor]));
+                    }
+                }
+            }
+            rows.push(NodeRow {
+                nodes: this_row
+                    .into_iter()
+                    .map(|(idx, node)| {
+                        let mut statements: Vec<_> = node
+                            .statements
+                            .iter() // Filter out the boring ones!
+                            .filter(|s| {
+                                s.kind.name() != "StorageLive" && s.kind.name() != "StorageDead"
+                            })
+                            .map(|x| format!("{:?}", x))
+                            .collect();
+                        let mut terminator_head = String::new();
+                        node.terminator()
+                            .kind
+                            .fmt_head(&mut terminator_head)
+                            .unwrap();
+                        statements.push(terminator_head);
+
+                        let name = format!("bb {}", idx.index());
+
+                        MirNode {
+                            id: idx,
+                            name,
+                            statements,
+                        }
+                    })
+                    .collect(),
+            });
+        }
+
+        MirBody {
+            label: fn_name,
+            rows,
+            edges,
         }
     }
+}
 
-    fn draw(&self, ui: &mut egui::Ui) {
+impl Widget for &MirBody {
+    // FIXME move the selected/not selected booleans here!
+    fn ui(self, ui: &mut Ui) -> egui::Response {
         ui.with_layout(egui::Layout::top_down(egui::Align::TOP), |ui| {
             egui::ScrollArea::both()
                 .id_source(&self.label)
                 .show(ui, |ui| {
-                    ui.heading(&self.label);
-                    self.render
-                        .show_max_size(ui, Vec2::splat(ui.available_width()));
+                    ui.with_layout(egui::Layout::top_down(egui::Align::TOP), |ui| {
+                        ui.heading(&self.label);
+                        let mut node_to_widget = HashMap::default();
+                        for row in self.rows.iter() {
+                            node_to_widget.extend(row.draw(ui));
+                            ui.add_space(20.0);
+                        }
+
+                        for edge in self.edges.iter() {
+                            edge.draw(&node_to_widget, ui);
+                        }
+                    });
                 });
-        });
+        })
+        .response
     }
 }
 
 #[derive(Default)]
 struct MirExplorer {
-    pub mir_graphs: Vec<MirWidget>,
+    pub mir_graphs: Vec<MirBody>,
     opened_file: Option<PathBuf>,
     open_file_dialog: Option<FileDialog>,
     functions: Vec<String>,
@@ -319,16 +358,7 @@ impl MirExplorer {
                         .map(|(_, fnn)| fnn.clone())
                         .collect();
 
-                    match rs_to_mir_png(open_file, &filtered_fns) {
-                        Ok(graphs) => graphs
-                            .into_iter()
-                            .map(|(name, raw_png)| MirWidget::new(name, raw_png))
-                            .collect(),
-                        Err(error) => {
-                            log::error!("Error generating graphs: {}", error);
-                            Vec::default()
-                        }
-                    }
+                    rs_to_mir(open_file, &filtered_fns).ok().unwrap() // FIXME
                 }
             }
         }
@@ -385,7 +415,7 @@ impl eframe::App for MirExplorer {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for mir in self.mir_graphs.iter() {
-                            mir.draw(ui);
+                            ui.add(mir);
                         }
                     })
             });
@@ -393,16 +423,24 @@ impl eframe::App for MirExplorer {
     }
 }
 
+fn end_triangle(
+    bottom_c: Pos2,
+    tip: Pos2,
+    bottom_scale: f32,
+    fill: Color32,
+    stroke: Stroke,
+) -> PathShape {
+    let bottom_tip_v = tip - bottom_c;
+    let bottom = bottom_c + bottom_tip_v.rot90() * bottom_scale;
+    let top = bottom_c + bottom_tip_v.rot90().rot90().rot90() * bottom_scale;
+    egui::epaint::PathShape::convex_polygon(vec![top, tip, bottom, top], fill, stroke)
+}
+
 fn main() {
     let instance = MirExplorer::new();
-
-    let options = eframe::NativeOptions {
-        initial_window_size: None,
-        ..Default::default()
-    };
     eframe::run_native(
         "Rust MIR visualiser",
-        options,
+        eframe::NativeOptions::default(),
         Box::new(|_cc| Box::new(instance)),
     )
     .expect("CRASHED");
