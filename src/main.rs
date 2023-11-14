@@ -141,19 +141,27 @@ impl MirEdge {
         let from = *rects.get(&self.from).unwrap();
         let to = rects.get(&self.to).unwrap();
 
-        let src_pos = from.center_bottom();
-        let dst_pos = to.center_top() - vec2(10.0, 10.0);
+        let src_pos = from.center_bottom() + vec2(0.0, 5.0);
+        let target_pos = to.center_top() - vec2(0.0, 5.0);
+
+        let src_to_target = (target_pos - src_pos).normalized();
+        let arrow_length = 10.0;
+        let arrow_backoff = 5.0;
+
+        let arrow_tip = target_pos - (src_to_target * arrow_backoff);
+        let arrow_bottom = arrow_tip - (src_to_target * arrow_length);
+
         let stroke = egui::Stroke {
             width: 2.0,
             color: Color32::from_rgb(96, 70, 59),
         };
 
-        let control_scale = ((dst_pos.x - src_pos.x) / 2.0).max(30.0);
+        let control_scale = ((arrow_bottom.x - src_pos.x) / 2.0).max(10.0);
         let src_control = src_pos + Vec2::X * control_scale;
-        let dst_control = dst_pos - Vec2::X * control_scale;
+        let dst_control = arrow_bottom - Vec2::X * control_scale;
 
         let bezier = CubicBezierShape::from_points_stroke(
-            [src_pos, src_control, dst_control, dst_pos],
+            [src_pos, src_control, dst_control, arrow_bottom],
             false,
             Color32::TRANSPARENT,
             stroke,
@@ -163,8 +171,8 @@ impl MirEdge {
         ui.painter().circle_stroke(src_pos, 2.0, stroke);
 
         ui.painter().add(end_triangle(
-            dst_pos,
-            to.center_top() - vec2(2.0, 2.0),
+            arrow_bottom,
+            arrow_tip,
             0.5,
             stroke.color,
             stroke,
@@ -180,7 +188,7 @@ struct MirNode {
 
 impl Widget for &MirNode {
     fn ui(self, ui: &mut Ui) -> egui::Response {
-        let margin = egui::vec2(15.0, 5.0);
+        let margin = egui::vec2(20.0, 5.0);
         let gunmetal = Color32::from_rgb(46, 49, 56);
 
         let background_shape = ui.painter().add(Shape::Noop);
@@ -321,7 +329,7 @@ impl Widget for &MirBody {
                         let mut node_to_widget = HashMap::default();
                         for row in self.rows.iter() {
                             node_to_widget.extend(row.draw(ui));
-                            ui.add_space(20.0);
+                            ui.add_space(75.0);
                         }
 
                         for edge in self.edges.iter() {

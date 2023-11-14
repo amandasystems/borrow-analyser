@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 pub fn position_dependent_outlives(x: &mut i32, cond: bool) -> &mut i32 {
     let y = &mut *x;
     if cond {
@@ -61,3 +63,11 @@ fn parse<'buf>(_buffer: &'buf mut String) -> &'buf str {
 pub fn main() {
     println!("Hello!");
 }
+
+fn main2() {
+    let a = 5;
+    let b = |_| &a;
+    bad(&b);
+}
+
+fn bad<F: Fn(&i32) -> &i32>(_: F) {}
